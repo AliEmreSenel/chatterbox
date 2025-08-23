@@ -2,16 +2,13 @@ from pathlib import Path
 
 import librosa
 import torch
-import perth
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
 from .models.s3tokenizer import S3_SR
 from .models.s3gen import S3GEN_SR, S3Gen
 
-
 REPO_ID = "ResembleAI/chatterbox"
-
 
 class ChatterboxVC:
     ENC_COND_LEN = 6 * S3_SR
@@ -26,7 +23,6 @@ class ChatterboxVC:
         self.sr = S3GEN_SR
         self.s3gen = s3gen
         self.device = device
-        self.watermarker = perth.PerthImplicitWatermarker()
         if ref_dict is None:
             self.ref_dict = None
         else:
@@ -100,5 +96,4 @@ class ChatterboxVC:
                 ref_dict=self.ref_dict,
             )
             wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        return torch.from_numpy(wav).unsqueeze(0)
