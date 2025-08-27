@@ -19,8 +19,10 @@ dependencies = [
     "resemble-perth==1.0.1",
     "conformer==0.3.2",
     "safetensors==0.5.3",
-    "tensorboard>=2.20.0",
     "peft>=0.17.1",
+    "tokenizers>=0.20.3",
+    "bitsandbytes>=0.47.0",
+    "tensorboard>=2.20.0",
 ]
 
 [project.urls]

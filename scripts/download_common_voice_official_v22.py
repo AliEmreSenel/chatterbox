@@ -145,7 +145,7 @@ def main(
                 meta_out.append(f"{out_wav}\t{sentence}\n")
         with open(Path(out) / "metadata.tsv", "w", encoding="utf-8") as f:
             f.writelines(meta_out)
-        print(f'Wrote {len(meta_out)} entries to {Path(out) / "metadata.tsv"}')
+        print(f"Wrote {len(meta_out)} entries to {Path(out) / 'metadata.tsv'}")
     finally:
         try:
             shutil.rmtree(tmp)
