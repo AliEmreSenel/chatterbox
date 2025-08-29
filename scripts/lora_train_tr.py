@@ -59,56 +59,34 @@ def main():
     state = load_file(Path(args.ckpt_dir) / "t3_cfg.safetensors")
     t3.load_state_dict(state)
 
-    try:
-        tok_vocab = len(en_tok.tokenizer.get_vocab())
-    except Exception:
-        tok_vocab = getattr(en_tok.tokenizer, "get_vocab_size", lambda: None)() or None
+    tok_vocab = len(en_tok.tokenizer.get_vocab())
 
-    try:
-        if tok_vocab is not None and hasattr(t3, "text_emb"):
-            cur_size = getattr(t3.text_emb, "num_embeddings", None)
-            if cur_size is None and hasattr(t3.text_emb, "weight"):
-                cur_size = t3.text_emb.weight.size(0)
-            if cur_size is not None and tok_vocab > cur_size:
-                old_emb = t3.text_emb
-                new_emb = torch.nn.Embedding(tok_vocab, old_emb.embedding_dim)
-                with torch.no_grad():
-                    new_emb.weight[:cur_size].data.copy_(old_emb.weight[:cur_size].data)
-                    try:
-                        std = float(old_emb.weight.std().item())
-                    except Exception:
-                        std = 0.02
-                    torch.nn.init.normal_(new_emb.weight[cur_size:], mean=0.0, std=std)
-                t3.text_emb = new_emb
-                if hasattr(t3, "text_head"):
-                    old_head = t3.text_head
-                    hidden = old_head.in_features
-                    new_head = torch.nn.Linear(
-                        hidden, tok_vocab, bias=getattr(old_head, "bias") is not None
-                    )
-                    with torch.no_grad():
-                        ncopy = min(
-                            getattr(old_head, "out_features", old_head.weight.size(0)),
-                            tok_vocab,
-                        )
-                        new_head.weight[:ncopy].data.copy_(old_head.weight[:ncopy].data)
-                        if tok_vocab > ncopy:
-                            try:
-                                std = float(old_head.weight.std().item())
-                            except Exception:
-                                std = 0.02
-                            torch.nn.init.normal_(
-                                new_head.weight[ncopy:], mean=0.0, std=std
-                            )
-                        if (
-                            getattr(old_head, "bias", None) is not None
-                            and new_head.bias is not None
-                        ):
-                            new_head.bias[:ncopy].data.copy_(old_head.bias[:ncopy].data)
-                    t3.text_head = new_head
-    except Exception:
-        logger.exception("Failed while ensuring embeddings match tokenizer")
-        raise
+    cur_size = getattr(t3.text_emb, "num_embeddings", t3.text_emb.weight.size(0))
+
+    if tok_vocab > cur_size:
+        old_emb = t3.text_emb
+        new_emb = torch.nn.Embedding(tok_vocab, old_emb.embedding_dim)
+        with torch.no_grad():
+            new_emb.weight[:cur_size].copy_(old_emb.weight[:cur_size])
+            std = float(old_emb.weight.std().item())
+            torch.nn.init.normal_(new_emb.weight[cur_size:], mean=0.0, std=std)
+        t3.text_emb = new_emb
+
+        if hasattr(t3, "text_head"):
+            old_head = t3.text_head
+            hidden = old_head.in_features
+            new_head = torch.nn.Linear(
+                hidden, tok_vocab, bias=(old_head.bias is not None)
+            )
+            with torch.no_grad():
+                ncopy = min(old_head.out_features, tok_vocab)
+                new_head.weight[:ncopy].copy_(old_head.weight[:ncopy])
+                if tok_vocab > ncopy:
+                    std = float(old_head.weight.std().item())
+                    torch.nn.init.normal_(new_head.weight[ncopy:], mean=0.0, std=std)
+                if old_head.bias is not None:
+                    new_head.bias[:ncopy].copy_(old_head.bias[:ncopy])
+            t3.text_head = new_head
 
     lora_config = LoraConfig(
         r=8, lora_alpha=32, target_modules="all-linear", inference_mode=False

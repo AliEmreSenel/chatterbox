@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 import torch
-from dataset_utils import SimpleMetaDataset, collate_s3gen, recreate_missing_cache
+from dataset_utils import SimpleMetaDataset, collate_s3gen
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from torch.amp import autocast
 from torch.utils.data import DataLoader
@@ -15,7 +15,6 @@ from tqdm import tqdm
 
 from safetensors.torch import load_file
 from chatterbox.models.s3gen import S3Gen
-from chatterbox.models.s3tokenizer import S3Tokenizer
 from torchinfo import summary
 import bitsandbytes as bnb
 
@@ -47,18 +46,8 @@ def main():
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_fast = bool(getattr(args, "fast", False))
 
-    s3tok = S3Tokenizer()
-    try:
-        if torch.cuda.is_available() and getattr(args, "num_workers", 0) == 0:
-            s3tok.to("cuda")
-    except Exception:
-        pass
-
-    ds = SimpleMetaDataset(
-        args.meta, s3tok, cache_dir=args.cache_dir, force_recompute=args.force_recompute
-    )
+    ds = SimpleMetaDataset(args.meta, cache_dir=args.cache_dir)
 
     s3gen = S3Gen()
     state = load_file(Path(args.ckpt_dir) / "s3gen.safetensors")
@@ -67,14 +56,6 @@ def main():
         logger.warning("Missing keys in checkpoint: %s", res.missing_keys)
     if getattr(res, "unexpected_keys", None):
         logger.warning("Unexpected keys in checkpoint: %s", res.unexpected_keys)
-
-    if args.cache_dir:
-        try:
-            recreate_missing_cache(
-                args.cache_dir, ds.items, s3tok, s3gen, batch_size=32
-            )
-        except Exception:
-            logger.exception("Failed while recreating missing cache entries")
 
     dl = DataLoader(
         ds,
@@ -90,7 +71,6 @@ def main():
         target_modules="all-linear",
         inference_mode=False,
     )
-    del s3tok
     model = get_peft_model(s3gen.flow, lora_config)
 
     base = getattr(model, "base_model", model)
