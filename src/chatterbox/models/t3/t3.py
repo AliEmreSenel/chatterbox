@@ -314,6 +314,7 @@ class T3(nn.Module):
         )
         # Initialize kv_cache with the full context.
         past = output.past_key_values
+        predicted = []
 
         # ---- Generation Loop using kv_cache ----
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):

@@ -2,8 +2,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import librosa
+import numpy as np
 import torch
-import perth
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
@@ -14,10 +14,76 @@ from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
+import re
+import os
 
+from .audio_editing import splice_audios
 
 REPO_ID = "ResembleAI/chatterbox"
 
+
+def chunk_text(text: str, chunk_size: int = 300) -> list[str]:
+    """
+    Split `text` into chunks not exceeding `chunk_size`, preferring to split at sentence boundaries,
+    then commas, and as a last resort at word boundaries.
+    """
+    # First, split text into sentences
+    sentence_endings = re.compile(r'(?<=[.!?])\s+')
+    sentences = sentence_endings.split(text)
+
+    chunks = []
+    current = ''
+
+    def flush_current():
+        nonlocal current
+        if current:
+            chunks.append(current.strip())
+            current = ''
+
+    for sentence in sentences:
+        if len(current) + len(sentence) <= chunk_size:
+            current += (sentence + ' ')
+        else:
+            # If current is non-empty, flush it
+            if current:
+                flush_current()
+            # Process this sentence if it's too long
+            if len(sentence) <= chunk_size:
+                current = sentence + ' '
+            else:
+                # Split long sentence by commas
+                parts = sentence.split(',')
+                tmp = ''
+                for part in parts:
+                    segment = part + ','
+                    if len(tmp) + len(segment) <= chunk_size:
+                        tmp += segment
+                    else:
+                        # Flush tmp or split by words
+                        if tmp:
+                            chunks.append(tmp.strip().rstrip(','))
+                        # Now handle segment if still too large
+                        if len(segment) <= chunk_size:
+                            tmp = segment
+                        else:
+                            # Split by words
+                            words = part.split()
+                            wtmp = ''
+                            for w in words:
+                                if len(wtmp) + len(w) + 1 <= chunk_size:
+                                    wtmp += w + ' '
+                                else:
+                                    chunks.append(wtmp.strip())
+                                    wtmp = w + ' '
+                            if wtmp:
+                                chunks.append(wtmp.strip())
+                            tmp = ''
+                if tmp:
+                    chunks.append(tmp.strip().rstrip(','))
+                current = ''
+    # Flush any remaining text
+    flush_current()
+    return chunks
 
 def punc_norm(text: str) -> str:
     """
@@ -123,7 +189,6 @@ class ChatterboxTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
 
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
@@ -205,7 +270,7 @@ class ChatterboxTTS:
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
-    def generate(
+    def _generate_segment(
         self,
         text,
         repetition_penalty=1.2,
@@ -215,6 +280,8 @@ class ChatterboxTTS:
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
+        max_new_tokens: int = 1000,
+        prepend_text: str = None,
     ):
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
@@ -232,7 +299,12 @@ class ChatterboxTTS:
 
         # Norm and tokenize text
         text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        # ensure tokens are placed on the same device as the text embedding to avoid cross-device tensors
+        try:
+            emb_dev = next(self.t3.text_emb.parameters()).device
+        except Exception:
+            emb_dev = torch.device(self.device)
+        text_tokens = self.tokenizer.text_to_tokens(text).to(emb_dev)
 
         if cfg_weight > 0.0:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
@@ -268,5 +340,23 @@ class ChatterboxTTS:
                 ref_dict=self.conds.gen,
             )
             wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        return torch.from_numpy(wav).unsqueeze(0)
+
+
+    def generate(
+        self,
+        text,
+        chunk_size: int = 300,
+        **kwargs,
+    ):
+        """Generate speech from ``text``. Long texts are processed in ``chunk_size`` character chunks."""
+        if len(text) <= chunk_size:
+            return self._generate_segment(text, **kwargs)
+
+        chunks = chunk_text(text, chunk_size)
+        audio_segments = []
+        for chunk in chunks:
+            wav = self._generate_segment(chunk, **kwargs)
+            audio_segments.append(wav.squeeze(0).cpu().numpy())
+        merged = splice_audios(audio_segments)
+        return torch.from_numpy(merged).unsqueeze(0)
