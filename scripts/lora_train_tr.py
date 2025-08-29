@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from safetensors.torch import load_file
+from chatterbox.models.s3gen import S3Gen
 from chatterbox.models.s3tokenizer import S3Tokenizer
 from chatterbox.models.t3.t3 import T3
 from chatterbox.models.tokenizers import EnTokenizer
@@ -182,9 +184,20 @@ def main():
         cache_dir=args.cache_dir,
         force_recompute=args.force_recompute,
     )
+
+    s3gen = S3Gen()
+    state = load_file(Path(args.ckpt_dir) / "s3gen.safetensors")
+    res = s3gen.load_state_dict(state, strict=False)
+    if getattr(res, "missing_keys", None):
+        logger.warning("Missing keys in checkpoint: %s", res.missing_keys)
+    if getattr(res, "unexpected_keys", None):
+        logger.warning("Unexpected keys in checkpoint: %s", res.unexpected_keys)
+
     if args.cache_dir:
         try:
-            recreate_missing_cache(args.cache_dir, ds.items, s3tok, batch_size=32)
+            recreate_missing_cache(
+                args.cache_dir, ds.items, s3tok, s3gen, batch_size=32
+            )
         except Exception:
             logger.exception("Failed while recreating missing cache entries")
 
@@ -250,8 +263,42 @@ def main():
         logger.exception("Failed while ensuring embeddings match tokenizer")
         raise
 
+    # Auto-detect LoRA target module name substrings from the T3 model
+    candidate_tokens = set()
+    for name, mod in t3.named_modules():
+        parts = name.split(".") if name else []
+        for p in parts[-2:]:
+            # avoid adding a generic "mlp" token which may refer to a composite module
+            # (e.g. LlamaMLP) that contains Linear children; targeting the inner
+            # proj/linear names is safer and supported by PEFT.
+            if p == "mlp":
+                continue
+            if any(
+                x in p
+                for x in (
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "proj",
+                    "linear",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                )
+            ):
+                candidate_tokens.add(p)
+        cls = mod.__class__.__name__.lower()
+        if "linear" in cls or "dense" in cls:
+            candidate_tokens.add("linear")
+        if "proj" in cls:
+            candidate_tokens.add("proj")
+    if not candidate_tokens:
+        candidate_tokens = {"q_proj", "v_proj"}
+    target_modules = list(candidate_tokens)
+    logger.info("Auto-detected target_modules for T3 LoRA: %s", target_modules)
+
     lora_config = LoraConfig(
-        r=8, lora_alpha=32, target_modules=["q_proj", "v_proj"], inference_mode=False
+        r=8, lora_alpha=32, target_modules=target_modules, inference_mode=False
     )
 
     if args.single_device_transformer and device.type == "cuda":
@@ -469,19 +516,47 @@ def main():
                         loss_res = _call_loss(
                             t3_cond, txt, txt_lens, speech_tokens, speech_lens
                         )
+                    # handle separate text and speech losses when returned as tuple/list
                     if isinstance(loss_res, (tuple, list)):
-                        loss = sum(
-                            (
-                                l
-                                if torch.is_tensor(l)
-                                else torch.tensor(float(l), device=device)
+                        try:
+                            lt_raw, ls_raw = loss_res
+                        except Exception:
+                            # fallback: sum all and split evenly
+                            total = sum(
+                                (
+                                    l
+                                    if torch.is_tensor(l)
+                                    else torch.tensor(float(l), device=device)
+                                )
+                                for l in loss_res
                             )
-                            for l in loss_res
-                        )
+                            lt = total * 0.5
+                            ls = total * 0.5
+                        else:
+                            lt = (
+                                lt_raw
+                                if torch.is_tensor(lt_raw)
+                                else torch.tensor(float(lt_raw), device=device)
+                            )
+                            ls = (
+                                ls_raw
+                                if torch.is_tensor(ls_raw)
+                                else torch.tensor(float(ls_raw), device=device)
+                            )
                     else:
-                        loss = loss_res
+                        # single loss returned: split evenly between text and speech
+                        total = (
+                            loss_res
+                            if torch.is_tensor(loss_res)
+                            else torch.tensor(float(loss_res), device=device)
+                        )
+                        lt = total * 0.5
+                        ls = total * 0.5
+                    # combined loss for backward
+                    loss = lt + ls
                     if not torch.is_tensor(loss):
                         loss = torch.tensor(float(loss), device=device)
+                    # scale for gradient accumulation
                     loss = loss / float(grad_accum)
                     if scaler is not None:
                         scaler.scale(loss).backward()
@@ -498,12 +573,29 @@ def main():
                         else:
                             optim.step()
                         optim.zero_grad()
+                        # report un-divided losses (per-step)
                         report_loss = (loss * float(grad_accum)).detach()
-                        loop.set_postfix(loss=float(report_loss.cpu().item()))
+                        report_loss_text = (lt * float(grad_accum)).detach()
+                        report_loss_speech = (ls * float(grad_accum)).detach()
+                        loop.set_postfix(
+                            loss=float(report_loss.cpu().item()),
+                            loss_text=float(report_loss_text.cpu().item()),
+                            loss_speech=float(report_loss_speech.cpu().item()),
+                        )
                         try:
                             tb_writer.add_scalar(
                                 "train/loss",
                                 float(report_loss.cpu().item()),
+                                global_step,
+                            )
+                            tb_writer.add_scalar(
+                                "train/loss_text",
+                                float(report_loss_text.cpu().item()),
+                                global_step,
+                            )
+                            tb_writer.add_scalar(
+                                "train/loss_speech",
+                                float(report_loss_speech.cpu().item()),
                                 global_step,
                             )
                         except Exception:

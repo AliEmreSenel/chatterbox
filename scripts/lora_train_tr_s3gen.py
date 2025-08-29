@@ -5,62 +5,24 @@ import sys
 from pathlib import Path
 
 import torch
-from dataset_utils import (SimpleMetaDataset, collate_s3gen,
-                           recreate_missing_cache)
+from dataset_utils import SimpleMetaDataset, collate_s3gen, recreate_missing_cache
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
+from safetensors.torch import load_file
 from chatterbox.models.s3gen import S3Gen
 from chatterbox.models.s3tokenizer import S3Tokenizer
+from torchinfo import summary
+import bitsandbytes as bnb
+
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def load_s3gen_from_ckpt(s3gen, ckpt_dir):
-    try:
-        from safetensors.torch import load_file
-    except Exception:
-        return
-    try:
-        state = load_file(Path(ckpt_dir) / "s3gen.safetensors")
-    except Exception:
-        return
-    try:
-        if "model" in state:
-            state = state["model"][0]
-    except Exception:
-        pass
-    import torch as _torch
-
-    for k, v in list(state.items()):
-        try:
-            tensor = _torch.as_tensor(v)
-        except Exception:
-            continue
-        parts = k.split(".")
-        obj = s3gen
-        ok = True
-        for p in parts[:-1]:
-            if hasattr(obj, p):
-                obj = getattr(obj, p)
-            else:
-                ok = False
-                break
-        if not ok:
-            continue
-        name = parts[-1]
-        if not hasattr(obj, name):
-            continue
-        param = getattr(obj, name)
-        try:
-            if param.shape == tensor.shape:
-                param.copy_(tensor)
-        except Exception:
-            pass
 
 
 def main():
@@ -98,151 +60,136 @@ def main():
         args.meta, s3tok, cache_dir=args.cache_dir, force_recompute=args.force_recompute
     )
 
+    s3gen = S3Gen()
+    state = load_file(Path(args.ckpt_dir) / "s3gen.safetensors")
+    res = s3gen.load_state_dict(state, strict=False)
+    if getattr(res, "missing_keys", None):
+        logger.warning("Missing keys in checkpoint: %s", res.missing_keys)
+    if getattr(res, "unexpected_keys", None):
+        logger.warning("Unexpected keys in checkpoint: %s", res.unexpected_keys)
+
     if args.cache_dir:
         try:
-            recreate_missing_cache(args.cache_dir, ds.items, s3tok, batch_size=32)
+            recreate_missing_cache(
+                args.cache_dir, ds.items, s3tok, s3gen, batch_size=32
+            )
         except Exception:
             logger.exception("Failed while recreating missing cache entries")
-
-    s3gen = S3Gen()
-    load_s3gen_from_ckpt(s3gen, args.ckpt_dir)
 
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=lambda b: collate_s3gen(b, s3tok, s3gen),
+        collate_fn=lambda b: collate_s3gen(b),
     )
-
-    # Dynamically determine reasonable target module name substrings for LoRA
-    candidate_tokens = set()
-    for name, mod in s3gen.named_modules():
-        # consider last part of name and full name
-        parts = name.split(".") if name else []
-        for p in parts[-2:]:
-            if any(x in p for x in ("proj", "linear", "conv", "embed", "mlp", "attn", "in_proj", "out_proj", "gate_proj", "up_proj", "down_proj")):
-                candidate_tokens.add(p)
-        # also check class name
-        cls = mod.__class__.__name__.lower()
-        if "conv" in cls:
-            candidate_tokens.add("conv")
-        if "linear" in cls or "dense" in cls:
-            candidate_tokens.add("linear")
-        if "projection" in cls or "proj" in cls:
-            candidate_tokens.add("proj")
-    # Fallback if nothing found
-    if not candidate_tokens:
-        candidate_tokens = {"proj", "linear", "conv"}
-    target_modules = list(candidate_tokens)
-    logger.info("Auto-detected target_modules for LoRA: %s", target_modules)
 
     lora_config = LoraConfig(
         r=8,
         lora_alpha=32,
-        target_modules=target_modules,
+        target_modules="all-linear",
         inference_mode=False,
     )
+    del s3tok
+    model = get_peft_model(s3gen.flow, lora_config)
 
-    try:
-        s3gen.to("cpu")
-    except Exception:
-        pass
-    model = get_peft_model(s3gen, lora_config)
+    base = getattr(model, "base_model", model)
+    flow = base
 
-    for name, p in model.named_parameters():
-        if "lora" in name.lower() and not p.requires_grad:
-            p.requires_grad_(True)
+    # encoder.forward -> checkpoint
+    if hasattr(flow, "encoder") and hasattr(flow.encoder, "forward"):
+        orig_enc = flow.encoder.forward
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+        def enc_forward(token_emb, token_len, *args, **kwargs):
+            return checkpoint(
+                lambda x: orig_enc(x, token_len, *args, **kwargs),
+                token_emb,
+                use_reentrant=False,
+            )
+
+        flow.encoder.forward = enc_forward
+
+    # encoder_proj (Linear) -> checkpoint
+    if hasattr(flow, "encoder_proj") and hasattr(flow.encoder_proj, "forward"):
+        orig_proj = flow.encoder_proj.forward
+
+        def proj_forward(x, *args, **kwargs):
+            return checkpoint(
+                lambda y: orig_proj(y, *args, **kwargs), x, use_reentrant=False
+            )
+
+        flow.encoder_proj.forward = proj_forward
+
+    # spk_embed_affine_layer (Linear) -> checkpoint
+    if hasattr(flow, "spk_embed_affine_layer") and hasattr(
+        flow.spk_embed_affine_layer, "forward"
+    ):
+        orig_spk = flow.spk_embed_affine_layer.forward
+
+        def spk_forward(x, *args, **kwargs):
+            return checkpoint(
+                lambda y: orig_spk(y, *args, **kwargs), x, use_reentrant=False
+            )
+
+        flow.spk_embed_affine_layer.forward = spk_forward
+
+    # input_embedding (Embedding) -> checkpoint
+    if hasattr(flow, "input_embedding") and hasattr(flow.input_embedding, "forward"):
+        orig_emb = flow.input_embedding.forward
+
+        def emb_forward(x, *args, **kwargs):
+            return checkpoint(
+                lambda y: orig_emb(y, *args, **kwargs), x, use_reentrant=False
+            )
+
+        flow.input_embedding.forward = emb_forward
+
+    # decoder.compute_loss -> checkpoint
+    if hasattr(flow, "decoder") and hasattr(flow.decoder, "compute_loss"):
+        orig_dec_cl = flow.decoder.compute_loss
+
+        def dec_compute_loss(*args, **kwargs):
+            return checkpoint(
+                lambda *targs: orig_dec_cl(*targs, **kwargs), *args, use_reentrant=False
+            )
+
+        flow.decoder.compute_loss = dec_compute_loss
+
+    trainable_params = [
+        p
+        for p in (model.parameters() if model is not None else model.parameters())
+        if p.requires_grad
+    ]
     if not trainable_params:
         raise RuntimeError("No trainable parameters available for training")
 
-    optim = torch.optim.Adam(trainable_params, lr=args.lr)
+    optim = bnb.optim.Adam8bit(trainable_params, lr=args.lr)
     tb_writer = SummaryWriter(log_dir=str(Path(args.out_dir) / "tb"))
     global_step = 0
 
-    model.train()
     model.to(device)
+    model.train()
 
     grad_accum = max(1, getattr(args, "grad_accum_steps", 1))
-    MAX_TARGET_T = 288
+
+    # print model summary for flow-only model
+    try:
+        summary(model)
+    except Exception:
+        pass
 
     for epoch in range(args.epochs):
         loop = tqdm(dl, desc=f"epoch {epoch}")
         accum = 0
         for batch in loop:
-            batch = {
-                k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()
-            }
-
-            import torch.nn.functional as F
-
-            from chatterbox.models.s3gen.utils.mask import make_pad_mask
-
-            use_bf16 = use_fast and (device.type == "cuda")
-            autocast_ctx = torch.cuda.amp.autocast(
-                enabled=use_bf16, dtype=torch.bfloat16 if use_bf16 else None
-            )
-
-            flow = model.flow
-            token = batch["speech_token"]
-            token_len = batch["speech_token_len"]
-            feat_orig = batch["speech_feat"]
-            feat = feat_orig.transpose(1, 2).contiguous()
-            feat_len = batch["speech_feat_len"]
-            embedding = batch["embedding"]
-
-            with autocast_ctx:
-                emb = F.normalize(embedding, dim=1)
-                emb = flow.spk_embed_affine_layer(emb)
-
-                max_token_len = int(token.size(1))
-                mask = (
-                    (~make_pad_mask(token_len, max_len=max_token_len))
-                    .float()
-                    .unsqueeze(-1)
-                    .to(device)
-                )
-                token_emb = flow.input_embedding(torch.clamp(token, min=0)) * mask
-
-                h, h_lengths = flow.encoder(token_emb, token_len)
-                h = flow.encoder_proj(h)
-
-                mu = h.transpose(1, 2).contiguous()
-                T_feat = feat.shape[2]
-                T_mu = mu.shape[2]
-                target_T = min(T_feat, T_mu, MAX_TARGET_T)
-
-                mask_feat = (~make_pad_mask(feat_len)).to(h)
-                if target_T < T_feat:
-                    feat = feat[:, :, :target_T].contiguous()
-                    if mask_feat.dim() == 3:
-                        mask_feat = mask_feat[:, :, :target_T].contiguous()
-                    else:
-                        mask_feat = mask_feat[:, :target_T].contiguous()
-                if target_T < T_mu:
-                    mu = mu[:, :, :target_T].contiguous()
-
-                conds = torch.zeros(
-                    (
-                        feat.size(0),
-                        feat.size(1),
-                        min(feat.shape[2], mu.shape[2], MAX_TARGET_T),
-                    ),
-                    device=feat.device,
-                    dtype=feat.dtype,
-                )
-                loss, _ = flow.decoder.compute_loss(
-                    feat, mask_feat.unsqueeze(1), mu, emb, cond=conds
-                )
-                if not torch.is_tensor(loss):
-                    loss = torch.tensor(float(loss), device=device)
+            with autocast("cuda"):
+                out = model(batch, device)
+                loss = out.get("loss") if isinstance(out, dict) else out
                 loss = loss / float(grad_accum)
 
             loss.backward()
             accum += 1
-            if accum % grad_accum == 0:
+            if accum >= grad_accum:
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optim.step()
                 optim.zero_grad()
@@ -254,6 +201,7 @@ def main():
                     )
                 except Exception:
                     logger.exception("Failed to write loss to TensorBoard")
+                accum = 0
                 global_step += 1
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)

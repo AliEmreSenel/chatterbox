@@ -298,6 +298,7 @@ dependencies = [
     { name = "tokenizers" },
     { name = "torch" },
     { name = "torchaudio" },
+    { name = "torchinfo" },
     { name = "transformers" },
 ]
 
@@ -316,6 +317,7 @@ requires-dist = [
     { name = "tokenizers", specifier = ">=0.20.3" },
     { name = "torch", specifier = "==2.6.0" },
     { name = "torchaudio", specifier = "==2.6.0" },
+    { name = "torchinfo", specifier = ">=1.8.0" },
     { name = "transformers", specifier = "==4.46.3" },
 ]
 
@@ -2212,6 +2214,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/be/ff09ae00e8de07241c06ea5853f706450be6ee56d8c1a99c261a230b9233/torchaudio-2.6.0-cp39-cp39-manylinux1_x86_64.whl", hash = "sha256:8c1a4d08e35a9ceaadadbff6e60bcb3442482f800369be350103dfd08b4ddf52", size = 3379298, upload-time = "2025-01-29T16:29:16.2Z" },
     { url = "https://files.pythonhosted.org/packages/e8/46/1a5cf6b40971420c92572272cc952a6f1401fadb54f1184fa76fb93ff7de/torchaudio-2.6.0-cp39-cp39-manylinux_2_28_aarch64.whl", hash = "sha256:72e77055d8e742475c6dfacf59fab09b1fc94d4423e14897e188b67cad3851c6", size = 1646041, upload-time = "2025-01-29T16:29:26.422Z" },
     { url = "https://files.pythonhosted.org/packages/2f/39/94778b2fe3fdd9312287c80b57e4e0c7d47e97e2cb8161b3af92df53326b/torchaudio-2.6.0-cp39-cp39-win_amd64.whl", hash = "sha256:d855da878a28c2e5e6fb3d76fcddd544f4d957a320b29602cea5af2fe0ad1f3a", size = 2448783, upload-time = "2025-01-29T16:29:18.39Z" },
+]
+
+[[package]]
+name = "torchinfo"
+version = "1.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/53/d9/2b811d1c0812e9ef23e6cf2dbe022becbe6c5ab065e33fd80ee05c0cd996/torchinfo-1.8.0.tar.gz", hash = "sha256:72e94b0e9a3e64dc583a8e5b7940b8938a1ac0f033f795457f27e6f4e7afa2e9", size = 25880, upload-time = "2023-05-14T19:23:26.377Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/72/25/973bd6128381951b23cdcd8a9870c6dcfc5606cb864df8eabd82e529f9c1/torchinfo-1.8.0-py3-none-any.whl", hash = "sha256:2e911c2918603f945c26ff21a3a838d12709223dc4ccf243407bce8b6e897b46", size = 23377, upload-time = "2023-05-14T19:23:24.141Z" },
 ]
 
 [[package]]

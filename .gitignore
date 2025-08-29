@@ -46,3 +46,10 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+adapter_dumps
+ckpt
+ckpt_tr
+ckpt_tr_hf
+lora_tr_out
+lora_tr_out_v1
+runs

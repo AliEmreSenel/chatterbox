@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 
+from tqdm import tqdm
 import torch
 import torchaudio as ta
 from torch.utils.data import Dataset
@@ -32,7 +33,8 @@ def read_meta(path):
                     wav_path = None
             else:
                 wav_path = str(p_path)
-            items.append({"wav": wav_path, "text": text})
+            if wav_path is not None:
+                items.append({"wav": wav_path, "text": text})
     return items
 
 
@@ -55,16 +57,19 @@ class SimpleMetaDataset(Dataset):
             cache_path = self.cache_dir / f"{idx}.pt"
             if cache_path.exists() and not self.force_recompute:
                 try:
-                    data = torch.load(str(cache_path), map_location="cpu")
+                    data = torch.load(str(cache_path))
                     if isinstance(data, dict):
                         return {
-                            "speech_tokens": data.get("speech_tokens"),
-                            "speech_lens": data.get("speech_token_lens")
-                            or data.get("speech_lens"),
-                            "text": data.get("text"),
+                            "speech_tokens": data["speech_tokens"],
+                            "speech_lens": data["speech_token_lens"],
+                            "text": data["text"],
                             "idx": idx,
                             "cache_path": str(cache_path),
-                            "wav": data.get("wav") or self.items[idx].get("wav"),
+                            "wav": data["wav"],
+                            "embedding": data["embedding"],
+                            "mel": data["mel"],
+                            "mel_len": data["mel_len"],
+                            "cache_used": True,
                         }
                 except Exception:
                     logger.exception(
@@ -79,130 +84,72 @@ class SimpleMetaDataset(Dataset):
         }
 
 
-def collate_s3gen(batch, s3tok, s3gen):
-    tokens = []
-    token_lens = []
-    feats = []
-    feat_lens = []
-    embeddings = []
+def collate_s3gen(batch):
+    toks = [b["speech_tokens"].long() for b in batch]
+    toks_pad = torch.nn.utils.rnn.pad_sequence(toks, batch_first=True, padding_value=0)
+    tok_lens = torch.tensor([t.size(0) for t in toks])
 
-    for it in batch:
-        wav_path = it.get("wav")
-        speech_tokens = it.get("speech_tokens")
-        speech_lens = it.get("speech_lens")
-        # load wav
-        if wav_path is None:
-            waveform = torch.zeros(1, 16000)
-            sr = 16000
-        else:
-            try:
-                waveform, sr = ta.load(wav_path)
-            except Exception:
-                logger.exception("Failed to load wav %s -- using silence", wav_path)
-                waveform = torch.zeros(1, 16000)
-                sr = 16000
-        if waveform.size(0) > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        if sr != 16000:
-            waveform = ta.transforms.Resample(sr, 16000)(waveform)
-        wav16 = waveform.squeeze(0)
-
-        # speech tokens: prefer cache
-        if speech_tokens is None:
-            try:
-                st, sl = s3tok([wav16])
-                st = st[0]
-                sl = sl[0]
-            except Exception:
-                logger.exception("S3Tokenizer failed for wav -- using empty tokens")
-                st = torch.zeros(1, dtype=torch.long)
-                sl = torch.tensor(1, dtype=torch.long)
-        else:
-            st = speech_tokens
-            sl = speech_lens
-            if not torch.is_tensor(st):
-                st = torch.as_tensor(st, dtype=torch.long)
-            if not torch.is_tensor(sl):
-                sl = torch.as_tensor(sl, dtype=torch.long)
-        tokens.append(st)
-        token_lens.append(
-            int(
-                sl.tolist()
-                if torch.is_tensor(sl) and sl.numel() > 1
-                else (sl.item() if torch.is_tensor(sl) else int(sl))
-            )
-        )
-
-        # compute mel at 24k and embedding
-        try:
-            wav24 = ta.transforms.Resample(16000, 24000)(wav16.unsqueeze(0)).squeeze(0)
-        except Exception:
-            wav24 = wav16
-        mel = s3gen.mel_extractor(wav24.unsqueeze(0)).transpose(1, 2)  # (1, T, n_mels)
-        feats.append(mel.squeeze(0))
-        feat_lens.append(mel.shape[1] if mel.dim() == 3 else mel.size(1))
-
-        # embedding via speaker encoder using 16k
-        try:
-            emb = s3gen.speaker_encoder.inference(wav16.unsqueeze(0))
-        except Exception:
-            emb = torch.zeros(
-                1,
-                (
-                    s3gen.speaker_encoder.output_size()
-                    if hasattr(s3gen.speaker_encoder, "output_size")
-                    else 192
-                ),
-            )
-        embeddings.append(emb.squeeze(0))
-
-    padded_tokens = torch.nn.utils.rnn.pad_sequence(
-        tokens, batch_first=True, padding_value=0
-    ).long()
-    token_lens_tensor = torch.tensor([t.size(0) for t in tokens], dtype=torch.long)
-
-    max_T = max(f.size(0) for f in feats)
-    n_mels = feats[0].size(1)
-    padded_feats = torch.zeros(len(feats), max_T, n_mels)
-    for i, f in enumerate(feats):
-        padded_feats[i, : f.size(0), :] = f
-    feat_lens_tensor = torch.tensor([int(x) for x in feat_lens], dtype=torch.long)
-
-    embeddings_tensor = torch.stack(embeddings, dim=0)
+    emb = torch.stack([b["embedding"] for b in batch], dim=0)
+    mels = torch.nn.utils.rnn.pad_sequence(
+        [b["mel"][: b["mel_len"]] for b in batch], batch_first=True, padding_value=0
+    )
+    mel_lens = torch.tensor([b["mel_len"] for b in batch])
 
     out = {
-        "speech_token": padded_tokens,
-        "speech_token_len": token_lens_tensor,
-        "speech_feat": padded_feats,
-        "speech_feat_len": feat_lens_tensor,
-        "embedding": embeddings_tensor,
+        "speech_token": toks_pad,
+        "speech_token_len": tok_lens,
+        "speech_feat": mels,
+        "speech_feat_len": mel_lens,
+        "embedding": emb,
     }
     return out
 
 
 def recreate_missing_cache(
-    cache_dir, meta_items, s3tok, batch_size=32, sample_rate=16000
+    cache_dir,
+    meta_items,
+    s3tok,
+    s3gen,
+    batch_size=32,
+    device=None,
 ):
+    """Recreate missing tokenizer caches on an optional device (e.g. 'cuda').
+
+    If s3gen is provided, compute and store speaker embeddings for each cached item.
+    """
+    device = (
+        torch.device(device)
+        if device is not None
+        else (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
+    )
     cache_dir = Path(cache_dir)
     total = len(meta_items)
     missing = [idx for idx in range(total) if not (cache_dir / f"{idx}.pt").exists()]
     logger.info(
-        "Using cache_dir=%s : %d/%d cached, %d missing",
+        "Using cache_dir=%s : %d/%d cached, %d missing (device=%s)",
         str(cache_dir),
         total - len(missing),
         total,
         len(missing),
+        str(device),
     )
     if not missing:
         return
     cache_dir.mkdir(parents=True, exist_ok=True)
-    from tqdm import tqdm
+
+    s3tok.to(device)
+    s3gen.to(device)
 
     pbar = tqdm(total=len(missing), desc="Recreating cache", unit="file")
     for i in range(0, len(missing), batch_size):
+        torch.cuda.empty_cache()
         batch_idxs = missing[i : i + batch_size]
-        wavs = []
         texts = []
+        wavs = []
+        wav_lens = []
+        wavs_24k = []
         valid_idxs = []
         for idx in batch_idxs:
             item = meta_items[idx]
@@ -211,51 +158,54 @@ def recreate_missing_cache(
             if not wav_path:
                 pbar.update(1)
                 continue
-            try:
-                waveform, sr = ta.load(wav_path)
-            except Exception:
-                logger.exception(
-                    "Failed to load wav %s for cache idx %d -- saving silence",
-                    wav_path,
-                    idx,
-                )
-                waveform = torch.zeros(1, sample_rate)
-                sr = sample_rate
+            waveform, sr = ta.load(wav_path)
             if waveform.size(0) > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
-            if sr != sample_rate:
-                waveform = ta.transforms.Resample(sr, sample_rate)(waveform)
-            wavs.append(waveform.squeeze(0))
+            waveform = ta.transforms.Resample(sr, 16000).to(device)(waveform.to(device))
+            waveform_24k = ta.transforms.Resample(sr, 24000).to(device)(
+                waveform.to(device)
+            )
+
+            wavs.append(waveform.squeeze(0).to(device))
+            wav_lens.append(waveform_24k.size(1))
+            wavs_24k.append(waveform_24k.squeeze(0).to(device))
             texts.append(text)
             valid_idxs.append(idx)
         if not valid_idxs:
             continue
-        try:
+        with torch.no_grad():
             toks, lens = s3tok(wavs)
-        except Exception:
-            logger.exception(
-                "S3Tokenizer failed while recreating cache for batch starting at %d", i
+            embs = s3gen.speaker_encoder.inference(wavs)
+
+            wavs_24k = torch.nn.utils.rnn.pad_sequence(
+                wavs_24k, batch_first=True, padding_value=0.0
+            ).to(device)
+            mels = s3gen.mel_extractor(wavs_24k).transpose(1, 2)
+
+            feat_lens = torch.tensor(
+                [int(mels.shape[1] * L / wavs_24k.size(1)) for L in wav_lens]
             )
-            pbar.update(len(valid_idxs))
-            continue
         for j, idx in enumerate(valid_idxs):
-            tok = toks[j]
-            ln = lens[j]
-            if not torch.is_tensor(tok):
-                tok = torch.as_tensor(tok)
-            if not torch.is_tensor(ln):
-                ln = torch.as_tensor(ln, dtype=torch.long)
+            tok = toks[j].cpu()
+            ln = lens[j].cpu()
+            emb = embs[j].cpu()
+            mel = mels[j].cpu()
+            mel_len = feat_lens[j].cpu()
+
             cpath = cache_dir / f"{idx}.pt"
             try:
-                torch.save(
-                    {
-                        "speech_tokens": tok,
-                        "speech_token_lens": ln,
-                        "text": texts[j],
-                        "wav": None,
-                    },
-                    str(cpath),
-                )
+                save_obj = {
+                    "speech_tokens": tok,
+                    "speech_token_lens": ln,
+                    "text": texts[j],
+                    "wav": (
+                        meta_items[idx].get("wav") if idx < len(meta_items) else None
+                    ),
+                    "embedding": emb,
+                    "mel": mel,
+                    "mel_len": mel_len,
+                }
+                torch.save(save_obj, str(cpath))
             except Exception:
                 logger.exception("Failed to write cache %s", str(cpath))
             pbar.update(1)
