@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 from torchinfo import summary
+from chatterbox.models.t3.modules.t3_config import T3Config
 from dataset_utils import SimpleMetaDataset, collate_t3
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from torch.utils.data import DataLoader
@@ -22,45 +23,6 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def load_t3_from_ckpt(t3, ckpt_dir):
-    try:
-        state = load_file(Path(ckpt_dir) / "t3_cfg.safetensors")
-    except Exception:
-        return
-    try:
-        if "model" in state:
-            state = state["model"][0]
-    except Exception:
-        pass
-    import torch as _torch
-
-    for k, v in list(state.items()):
-        try:
-            tensor = _torch.as_tensor(v)
-        except Exception:
-            continue
-        parts = k.split(".")
-        obj = t3
-        ok = True
-        for p in parts[:-1]:
-            if hasattr(obj, p):
-                obj = getattr(obj, p)
-            else:
-                ok = False
-                break
-        if not ok:
-            continue
-        name = parts[-1]
-        if not hasattr(obj, name):
-            continue
-        param = getattr(obj, name)
-        try:
-            if param.shape == tensor.shape:
-                param.copy_(tensor)
-        except Exception:
-            pass
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt_dir", required=True)
@@ -71,14 +33,7 @@ def main():
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--cache_dir", type=str, default=None)
-    p.add_argument("--auto_offload", action="store_true")
-    p.add_argument("--single_device_transformer", action="store_true")
     p.add_argument("--fp16", action="store_true")
-    p.add_argument(
-        "--fast",
-        action="store_true",
-        help="Enable bnb 8-bit optimizer and bfloat16/autocast fast path (used in s3gen script)",
-    )
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=4)
     args = p.parse_args()
@@ -99,9 +54,10 @@ def main():
         num_workers=args.num_workers,
         collate_fn=lambda b: collate_t3(b, en_tok),
     )
-
-    t3 = T3()
-    load_t3_from_ckpt(t3, args.ckpt_dir)
+    t3_conf = T3Config()
+    t3 = T3(t3_conf)
+    state = load_file(Path(args.ckpt_dir) / "t3_cfg.safetensors")
+    t3.load_state_dict(state)
 
     try:
         tok_vocab = len(en_tok.tokenizer.get_vocab())
@@ -270,6 +226,8 @@ def main():
                         global_step,
                     )
                     global_step += 1
+                    accum_loss_text = 0.0
+                    accum_loss_speech = 0.0
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     peft_state = get_peft_model_state_dict(model)
