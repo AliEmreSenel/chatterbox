@@ -39,14 +39,9 @@ def read_meta(path):
 
 
 class SimpleMetaDataset(Dataset):
-    def __init__(
-        self, meta_path, s3tok, sample_rate=16000, cache_dir=None, force_recompute=False
-    ):
+    def __init__(self, meta_path, cache_dir=None, force_recompute=False):
         self.items = read_meta(meta_path)
-        self.s3tok = s3tok
-        self.sample_rate = sample_rate
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
-        self.force_recompute = bool(force_recompute)
 
     def __len__(self):
         return len(self.items)
@@ -55,7 +50,7 @@ class SimpleMetaDataset(Dataset):
         cache_path = None
         if self.cache_dir is not None:
             cache_path = self.cache_dir / f"{idx}.pt"
-            if cache_path.exists() and not self.force_recompute:
+            if cache_path.exists():
                 try:
                     data = torch.load(str(cache_path))
                     if isinstance(data, dict):
@@ -72,16 +67,8 @@ class SimpleMetaDataset(Dataset):
                             "cache_used": True,
                         }
                 except Exception:
-                    logger.exception(
-                        "Failed to load cache %s, will recompute", cache_path
-                    )
-        it = self.items[idx]
-        return {
-            "wav": it.get("wav"),
-            "text": it.get("text"),
-            "idx": idx,
-            "cache_path": str(cache_path) if cache_path is not None else None,
-        }
+                    logger.exception("Oh shit %s", cache_path)
+        raise Exception("asgkjbasgfaerwgiugiuawbhgoiuhewiughaewiughiuewah")
 
 
 def collate_s3gen(batch):
@@ -101,6 +88,36 @@ def collate_s3gen(batch):
         "speech_feat": mels,
         "speech_feat_len": mel_lens,
         "embedding": emb,
+    }
+    return out
+
+
+def collate_t3(batch, en_tok):
+    toks = [b["speech_tokens"].long() for b in batch]
+    toks_pad = torch.nn.utils.rnn.pad_sequence(toks, batch_first=True, padding_value=0)
+    tok_lens = torch.tensor([t.size(0) for t in toks])
+
+    texts = [b["text"] for b in batch]
+
+    sot_id = en_tok.tokenizer.token_to_id("[START]")
+    eot_id = en_tok.tokenizer.token_to_id("[STOP]")
+    txt_ids = []
+    for t_ids, txt in zip([None] * len(texts), texts):
+        if t_ids is not None:
+            ids = [sot_id] + list(t_ids) + [eot_id]
+        else:
+            ids = [sot_id] + en_tok.encode(txt) + [eot_id]
+        txt_ids.append(torch.tensor(ids, dtype=torch.long))
+    txt_padded = torch.nn.utils.rnn.pad_sequence(
+        txt_ids, batch_first=True, padding_value=0
+    )
+    txt_lens = torch.tensor([t.numel() for t in txt_ids], dtype=torch.long)
+
+    out = {
+        "text_tokens": txt_padded,
+        "text_lens": txt_lens,
+        "speech_tokens": toks_pad,
+        "speech_lens": tok_lens,
     }
     return out
 
