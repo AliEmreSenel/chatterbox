@@ -14,6 +14,7 @@ else:
 print(f"Using device: {device}")
 
 model = ChatterboxTTS.from_pretrained(device=device)
+# model = ChatterboxTTS.from_local("ckpt", device=device)
 
 text = "Merhaba! Bugün nasılsın? Bu cümle Türkçe ses sentezi için bir testtir."
 wav = model.generate(text)

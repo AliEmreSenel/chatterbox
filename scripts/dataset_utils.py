@@ -62,6 +62,7 @@ class SimpleMetaDataset(Dataset):
                             "cache_path": str(cache_path),
                             "wav": data["wav"],
                             "embedding": data["embedding"],
+                            "speaker_emb": data["cond_speaker_emb"],
                             "mel": data["mel"],
                             "mel_len": data["mel_len"],
                             "cache_used": True,
@@ -73,7 +74,9 @@ class SimpleMetaDataset(Dataset):
 
 def collate_s3gen(batch):
     toks = [b["speech_tokens"].long() for b in batch]
-    toks_pad = torch.nn.utils.rnn.pad_sequence(toks, batch_first=True, padding_value=0)
+    toks_pad = torch.nn.utils.rnn.pad_sequence(
+        toks, batch_first=True, padding_value=6562
+    )
     tok_lens = torch.tensor([t.size(0) for t in toks])
 
     emb = torch.stack([b["embedding"] for b in batch], dim=0)
@@ -93,31 +96,45 @@ def collate_s3gen(batch):
 
 
 def collate_t3(batch, en_tok):
-    toks = [b["speech_tokens"].long() for b in batch]
-    toks_pad = torch.nn.utils.rnn.pad_sequence(toks, batch_first=True, padding_value=0)
-    tok_lens = torch.tensor([t.size(0) for t in toks])
+    toks = [b["speech_tokens"][: b["speech_lens"]].long() for b in batch]
+    tok_lens = [b["speech_lens"] for b in batch]
+    start_speech_token = 6561
+    stop_speech_token = 6562
+    new_toks = []
+    new_tok_lens = []
+    for i, tok in enumerate(toks):
+        new_tok = torch.cat(
+            [torch.tensor([start_speech_token]), tok, torch.tensor([stop_speech_token])]
+        )
+        new_toks.append(new_tok)
+        new_tok_lens.append(tok_lens[i] + 2)
+    new_tok_lens = torch.tensor(new_tok_lens).long()
+
+    new_toks_pad = torch.nn.utils.rnn.pad_sequence(
+        new_toks, batch_first=True, padding_value=6562
+    )
 
     texts = [b["text"] for b in batch]
 
     sot_id = en_tok.tokenizer.token_to_id("[START]")
     eot_id = en_tok.tokenizer.token_to_id("[STOP]")
     txt_ids = []
-    for t_ids, txt in zip([None] * len(texts), texts):
-        if t_ids is not None:
-            ids = [sot_id] + list(t_ids) + [eot_id]
-        else:
-            ids = [sot_id] + en_tok.encode(txt) + [eot_id]
+    for txt in texts:
+        ids = [sot_id] + en_tok.encode(txt) + [eot_id]
         txt_ids.append(torch.tensor(ids, dtype=torch.long))
     txt_padded = torch.nn.utils.rnn.pad_sequence(
-        txt_ids, batch_first=True, padding_value=0
+        txt_ids, batch_first=True, padding_value=eot_id
     )
     txt_lens = torch.tensor([t.numel() for t in txt_ids], dtype=torch.long)
+
+    speaker_embs = torch.stack([b["speaker_emb"].float() for b in batch])
 
     out = {
         "text_tokens": txt_padded,
         "text_lens": txt_lens,
-        "speech_tokens": toks_pad,
-        "speech_lens": tok_lens,
+        "speech_tokens": new_toks_pad,
+        "speech_lens": new_tok_lens,
+        "speaker_embs": speaker_embs,
     }
     return out
 
@@ -126,6 +143,7 @@ def recreate_missing_cache(
     cache_dir,
     meta_items,
     s3tok,
+    ve,
     s3gen,
     batch_size=32,
     device=None,
@@ -164,6 +182,7 @@ def recreate_missing_cache(
         torch.cuda.empty_cache()
         batch_idxs = missing[i : i + batch_size]
         texts = []
+        wavs_16k = []
         wavs = []
         wav_lens = []
         wavs_24k = []
@@ -186,6 +205,7 @@ def recreate_missing_cache(
             wavs.append(waveform.squeeze(0).to(device))
             wav_lens.append(waveform_24k.size(1))
             wavs_24k.append(waveform_24k.squeeze(0).to(device))
+            wavs_16k.append(waveform.squeeze(0).cpu().numpy())
             texts.append(text)
             valid_idxs.append(idx)
         if not valid_idxs:
@@ -193,6 +213,8 @@ def recreate_missing_cache(
         with torch.no_grad():
             toks, lens = s3tok(wavs)
             embs = s3gen.speaker_encoder.inference(wavs)
+            speaker_embs_np = ve.embeds_from_wavs(wavs_16k, sample_rate=16000)
+            speaker_embs = torch.from_numpy(speaker_embs_np)
 
             wavs_24k = torch.nn.utils.rnn.pad_sequence(
                 wavs_24k, batch_first=True, padding_value=0.0
@@ -206,6 +228,7 @@ def recreate_missing_cache(
             tok = toks[j].cpu()
             ln = lens[j].cpu()
             emb = embs[j].cpu()
+            speaker_emb = speaker_embs[j].cpu()
             mel = mels[j].cpu()
             mel_len = feat_lens[j].cpu()
 
@@ -219,6 +242,7 @@ def recreate_missing_cache(
                         meta_items[idx].get("wav") if idx < len(meta_items) else None
                     ),
                     "embedding": emb,
+                    "cond_speaker_emb": speaker_emb,
                     "mel": mel,
                     "mel_len": mel_len,
                 }

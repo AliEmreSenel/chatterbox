@@ -8,11 +8,25 @@ from pathlib import Path
 import logging
 import sys
 
+from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 import torch
 import torchaudio as ta
 
-from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from chatterbox.tts import ChatterboxTTS
+
+
+def trace_calls(frame, event, arg):
+    if event == "call":
+        code = frame.f_code
+        func_name = code.co_name
+        filename = code.co_filename
+        lineno = frame.f_lineno
+        print(f"Call to {func_name} in {filename}:{lineno}")
+    return trace_calls
+
+
+# Enable tracing
+# sys.settrace(trace_calls)
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -90,55 +104,24 @@ if __name__ == "__main__":
     new_head = new_head.to(tts.t3.text_head.weight.device)
     setattr(tts.t3, "text_head", new_head)
 
-    candidate_tokens = set()
-    for name, mod in tts.t3.named_modules():
-        parts = name.split(".") if name else []
-        for p in parts[-2:]:
-            # avoid adding a generic "mlp" token which may refer to a composite module
-            # (e.g. LlamaMLP) that contains Linear children; targeting the inner
-            # proj/linear names is safer and supported by PEFT.
-            if p == "mlp":
-                continue
-            if any(
-                x in p
-                for x in (
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "proj",
-                    "linear",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                )
-            ):
-                candidate_tokens.add(p)
-        cls = mod.__class__.__name__.lower()
-        if "linear" in cls or "dense" in cls:
-            candidate_tokens.add("linear")
-        if "proj" in cls:
-            candidate_tokens.add("proj")
-    if not candidate_tokens:
-        candidate_tokens = {"q_proj", "v_proj"}
-    target_modules = list(candidate_tokens)
-
     # wrap t3
     lora_cfg_t3 = LoraConfig(
-        r=8, lora_alpha=32, target_modules=target_modules, inference_mode=True
+        r=8,
+        lora_alpha=16,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "donw_proj",
+        ],
+        inference_mode=True,
     )
 
     tts.t3 = get_peft_model(tts.t3, lora_cfg_t3)
     logger.info("Wrapped tts.t3 with PEFT for LoRA application")
-
-    lora_cfg_s3 = LoraConfig(
-        r=8,
-        lora_alpha=32,
-        target_modules="all-linear",
-        inference_mode=False,
-    )
-
-    tts.s3gen = get_peft_model(tts.s3gen, lora_cfg_s3)
-    logger.info("Wrapped tts.s3gen with PEFT for LoRA application")
 
     adapter_path = Path(args.adapter_dir)
     if adapter_path.exists():
@@ -146,18 +129,25 @@ if __name__ == "__main__":
         t3_lora = adapter_path / "lora_t3_state.pt"
         if t3_lora.exists():
             sd = _torch_load_verbose(t3_lora, map_location="cpu")
-            if isinstance(sd, dict):
-                if "t3_state" in sd:
-                    sd = sd["t3_state"]
-                logger.info("Applying t3 LoRA from %s via PEFT", t3_lora)
-                set_peft_model_state_dict(tts.t3, sd)
+            print(sd)
+            logger.info("Applying t3 LoRA from %s via PEFT", t3_lora)
+            set_peft_model_state_dict(tts.t3, sd)
         # apply s3gen LoRA
         s3_lora = adapter_path / "s3gen_lora_finetuned.pt"
-        if s3_lora.exists() and hasattr(tts, "s3gen"):
+        if s3_lora.exists():
+            lora_cfg_s3 = LoraConfig(
+                r=8,
+                lora_alpha=32,
+                target_modules="all-linear",
+                inference_mode=True,
+            )
+
+            tts.s3gen = get_peft_model(tts.s3gen, lora_cfg_s3)
+
+            logger.info("Wrapped tts.s3gen with PEFT for LoRA application")
             sd = _torch_load_verbose(s3_lora, map_location="cpu")
-            if isinstance(sd, dict):
-                logger.info("Applying s3gen LoRA from %s via PEFT", s3_lora)
-                set_peft_model_state_dict(tts.s3gen, sd)
+            logger.info("Applying s3gen LoRA from %s via PEFT", s3_lora)
+            set_peft_model_state_dict(tts.s3gen, sd)
 
     # Move models to target device before generation
     tts.device = device

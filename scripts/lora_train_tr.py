@@ -33,7 +33,6 @@ def main():
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--cache_dir", type=str, default=None)
-    p.add_argument("--fp16", action="store_true")
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=4)
     args = p.parse_args()
@@ -89,7 +88,18 @@ def main():
             t3.text_head = new_head
 
     lora_config = LoraConfig(
-        r=8, lora_alpha=32, target_modules="all-linear", inference_mode=False
+        r=8,
+        lora_alpha=16,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "donw_proj",
+        ],
+        inference_mode=False,
     )
 
     t3.to("cpu")
@@ -110,102 +120,73 @@ def main():
 
     summary(model)
 
-    optim = torch.optim.AdamW(trainable_params, lr=args.lr)
+    optim = torch.optim.Adam(trainable_params, lr=args.lr)
     tb_writer = SummaryWriter(log_dir=str(Path(args.out_dir) / "tb"))
     global_step = 0
     model.train()
     model.to(device)
 
-    grad_accum = max(1, int(args.grad_accum_steps))
-    use_fp16 = getattr(args, "fp16", False) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda") if use_fp16 else None
+    accum_ls = 0.0
+    accum_lt = 0.0
+    gamma = 0.2
 
-    accum_counter = 0
-    accum_loss_speech = 0.0
-    accum_loss_text = 0.0
     for epoch in range(args.epochs):
         loop = tqdm(dl, desc=f"epoch {epoch}")
 
-        for batch in loop:
+        for i, batch in enumerate(loop):
             batch = {
                 k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()
             }
-            txt = batch["text_tokens"].long().to(device)
 
-            B = txt.size(0)
-            txt_len_padded = int(txt.size(1))
-            txt_lens = torch.full((B,), txt_len_padded, dtype=torch.long, device=device)
+            txt = batch["text_tokens"].to(device)
+            txt_lens = batch["text_lens"].to(device)
+            speech_tokens = batch["speech_tokens"].to(device)
+            speech_lens = batch["speech_lens"].to(device)
+            speaker_embs = batch["speaker_embs"].to(device)
 
-            speech_tokens = batch.get("speech_tokens")
-            speech_tokens = speech_tokens.long().to(device)
+            B = speaker_embs.size(0)
+            emotion_tensor = torch.full((B, 1, 1), float(0.5), device=device)
+            t3_cond = T3Cond(speaker_emb=speaker_embs, emotion_adv=emotion_tensor)
 
-            speech_len_padded = int(speech_tokens.size(1))
-            speech_lens = torch.full(
-                (B,), speech_len_padded, dtype=torch.long, device=speech_tokens.device
+            lt, ls = model.loss(
+                t3_cond=t3_cond,
+                text_tokens=txt,
+                text_token_lens=txt_lens,
+                speech_tokens=speech_tokens,
+                speech_token_lens=speech_lens,
             )
 
-            spk_dim = (
-                getattr(t3, "hp", None) and getattr(t3.hp, "speaker_embed_size", None)
-            ) or 256
-            speaker_emb = torch.zeros(B, spk_dim, device=device)
-            emotion_tensor = torch.full((B, 1, 1), float(0.5), device=device)
-            t3_cond = T3Cond(speaker_emb=speaker_emb, emotion_adv=emotion_tensor)
-
-            with torch.amp.autocast("cuda", enabled=use_fp16):
-                lt, ls = model.loss(
-                    t3_cond=t3_cond,
-                    text_tokens=txt,
-                    text_token_lens=txt_lens,
-                    speech_tokens=speech_tokens,
-                    speech_token_lens=speech_lens,
+            # combined loss for backward
+            loss = (ls * gamma + lt * (1 - gamma)) / args.grad_accum_steps
+            accum_ls += ls.detach().cpu().item() / args.grad_accum_steps
+            accum_lt += lt.detach().cpu().item() / args.grad_accum_steps
+            loss.backward()
+            if i % args.grad_accum_steps == 0:
+                optim.step()
+                optim.zero_grad()
+                loop.set_postfix(
+                    loss=accum_ls * gamma + accum_lt * (1 - gamma),
+                    loss_text=accum_lt,
+                    loss_speech=accum_ls,
                 )
-
-                # combined loss for backward
-                loss = lt + ls
-
-                # scale for gradient accumulation
-                loss = loss / float(grad_accum)
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-
-                accum_counter += 1
-                accum_loss_text += lt.item()
-                accum_loss_speech += ls.item()
-                if accum_counter % grad_accum == 0:
-                    if scaler is not None:
-                        scaler.unscale_(optim)
-                        scaler.step(optim)
-                        scaler.update()
-                    else:
-                        optim.step()
-                    optim.zero_grad()
-
-                    total_loss = accum_loss_text + accum_loss_speech
-                    loop.set_postfix(
-                        loss=total_loss / grad_accum,
-                        loss_text=accum_loss_text / grad_accum,
-                        loss_speech=accum_loss_speech / grad_accum,
-                    )
-                    tb_writer.add_scalar(
-                        "train/loss",
-                        total_loss / grad_accum,
-                        global_step,
-                    )
-                    tb_writer.add_scalar(
-                        "train/loss_text",
-                        accum_loss_text / grad_accum,
-                        global_step,
-                    )
-                    tb_writer.add_scalar(
-                        "train/loss_speech",
-                        accum_loss_speech / grad_accum,
-                        global_step,
-                    )
-                    global_step += 1
-                    accum_loss_text = 0.0
-                    accum_loss_speech = 0.0
+                tb_writer.add_scalar(
+                    "train/loss",
+                    accum_ls * gamma + accum_lt * (1 - gamma),
+                    global_step,
+                )
+                tb_writer.add_scalar(
+                    "train/loss_text",
+                    accum_lt,
+                    global_step,
+                )
+                tb_writer.add_scalar(
+                    "train/loss_speech",
+                    accum_ls,
+                    global_step,
+                )
+                global_step += 1
+                accum_lt = 0.0
+                accum_ls = 0.0
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     peft_state = get_peft_model_state_dict(model)
